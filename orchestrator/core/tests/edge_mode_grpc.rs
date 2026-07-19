@@ -83,9 +83,18 @@ impl EdgeDaemonRepository for StubEdgeRepo {
             .cloned()
             .collect())
     }
+    async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+        Ok(self.edges.lock().await.values().cloned().collect())
+    }
     async fn update_status(&self, node_id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()> {
         if let Some(e) = self.edges.lock().await.get_mut(node_id) {
             e.status = status;
+        }
+        Ok(())
+    }
+    async fn record_heartbeat(&self, node_id: &NodeId) -> anyhow::Result<()> {
+        if let Some(e) = self.edges.lock().await.get_mut(node_id) {
+            e.status = NodePeerStatus::Active;
         }
         Ok(())
     }
@@ -769,9 +778,10 @@ mod prod_handler_stubs {
         }
     }
 
-    /// Build a fully-stubbed bundle of cluster use cases for the production
-    /// handler. None of them are reachable from the edge RPCs under test.
-    pub fn build_use_cases() -> (
+    /// Tuple of stubbed cluster use cases produced by [`build_use_cases`].
+    /// Aliased to keep the function signature within clippy's type-complexity
+    /// threshold; the production handler consumes these in fixed order.
+    pub type ClusterUseCaseBundle = (
         Arc<AttestNodeUseCase>,
         Arc<ChallengeNodeUseCase>,
         Arc<RegisterNodeUseCase>,
@@ -781,7 +791,11 @@ mod prod_handler_stubs {
         Arc<SyncConfigUseCase>,
         Arc<PushConfigUseCase>,
         Arc<dyn NodeClusterRepository>,
-    ) {
+    );
+
+    /// Build a fully-stubbed bundle of cluster use cases for the production
+    /// handler. None of them are reachable from the edge RPCs under test.
+    pub fn build_use_cases() -> ClusterUseCaseBundle {
         let cluster_repo: Arc<dyn NodeClusterRepository> = Arc::new(NoOpClusterRepo);
         let challenge_repo: Arc<dyn NodeChallengeRepository> = Arc::new(NoOpChallengeRepo);
         let enrolment_token_repo: Arc<dyn ClusterEnrolmentTokenRepository> =

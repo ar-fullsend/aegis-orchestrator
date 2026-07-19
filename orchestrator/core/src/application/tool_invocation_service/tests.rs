@@ -667,6 +667,17 @@ impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
         Ok(vec![])
     }
 
+    async fn list_paginated_all(
+        &self,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<
+        Vec<crate::domain::workflow::WorkflowExecution>,
+        crate::domain::repository::RepositoryError,
+    > {
+        Ok(vec![])
+    }
+
     async fn update_temporal_linkage_for_tenant(
         &self,
         _tenant_id: &TenantId,
@@ -2854,6 +2865,9 @@ async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
     // --- Capturing execution service ---
     struct CapturingExecutionService {
         execution: Execution,
+        // Held to keep the agent identifier alive for service construction
+        // even though the field itself is not read after init.
+        #[allow(dead_code)]
         agent_id_for_new_exec: AgentId,
         captured_identity: Arc<StdMutex<Option<Option<String>>>>,
     }

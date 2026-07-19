@@ -12,7 +12,7 @@
 //! ## Trait-based seam
 //!
 //! `ServiceManager` is the seam unit tests poke. Production binds to one of
-//! [`SystemdUserManager`] / [`LaunchdManager`] / [`NssmManager`]; tests bind
+//! `SystemdUserManager` / `LaunchdManager` / `NssmManager`; tests bind
 //! to a `MockServiceManager` that records invocations without spawning shell
 //! commands. This is how we cover install / uninstall / status without
 //! requiring systemd, launchd, or NSSM to be present in CI.
@@ -20,9 +20,9 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
+use std::process::Command;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Stdio;
-use std::process::Command;
 
 const SYSTEMD_SERVICE_TEMPLATE: &str = include_str!("../../../templates/aegis-edge.service");
 const LAUNCHD_PLIST_TEMPLATE: &str = include_str!("../../../templates/io.aegis.edge.plist");
@@ -30,9 +30,13 @@ const NSSM_TEMPLATE: &str = include_str!("../../../templates/aegis-edge.nssm.jso
 
 /// systemd unit name used for the user-scoped `aegis-edge` service.
 pub const SYSTEMD_UNIT: &str = "aegis-edge.service";
-/// launchd label used for the macOS LaunchAgent.
+/// launchd label used for the macOS LaunchAgent. Referenced by the
+/// platform-gated `LaunchctlServiceManager` only — unused on Linux/Windows.
+#[allow(dead_code)]
 pub const LAUNCHD_LABEL: &str = "io.aegis.edge";
-/// NSSM service name used on Windows.
+/// NSSM service name used on Windows. Referenced by the platform-gated
+/// `NssmServiceManager` only — unused on Linux/macOS.
+#[allow(dead_code)]
 pub const NSSM_SERVICE_NAME: &str = "AegisEdge";
 
 #[derive(Debug, Subcommand)]
@@ -112,8 +116,12 @@ pub async fn run(cmd: ServiceCommand) -> Result<()> {
 // ServiceManager trait + outcomes
 // ---------------------------------------------------------------------------
 
-/// Service unit kind detected at runtime.
+/// Service unit kind detected at runtime. The `Launchd` and `Nssm` variants
+/// are constructed only on macOS and Windows respectively; on other targets
+/// they are dead but must remain present so the same `ServiceKind` type
+/// covers all platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ServiceKind {
     SystemdUser,
     Launchd,
@@ -177,6 +185,7 @@ pub enum UninstallOutcome {
 /// Each platform impl wraps a single supervisor (systemd-user, launchd, NSSM).
 /// The trait is the seam tests poke — `MockServiceManager` records calls
 /// without spawning subprocesses. See `tests` module below.
+#[allow(dead_code)]
 pub trait ServiceManager {
     fn kind(&self) -> ServiceKind;
     fn unit_name(&self) -> &str;
@@ -230,10 +239,52 @@ pub fn detect_service_manager_for_install() -> Result<Box<dyn ServiceManager>> {
 /// Substitute `{{BINARY_PATH}}` (and `{{HOME}}` for the launchd plist) in the
 /// service unit template, using the currently-running `aegis` binary path so
 /// the unit launches the right binary across reinstalls.
+///
+/// For JSON-bodied templates (NSSM), naive string substitution would inject
+/// raw Windows paths like `C:\Program Files\Aegis\aegis.exe` whose backslashes
+/// the JSON parser then rejects. We detect a JSON template by parsing it and,
+/// on success, rewrite the placeholder fields via `serde_json` so the binary
+/// path is emitted as a properly-escaped JSON string. Non-JSON templates
+/// (systemd unit, launchd plist) keep the literal string substitution path.
 pub fn render_unit_template(template: &str, binary_path: &str, home_dir: &str) -> String {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(template) {
+        substitute_json_placeholders(&mut value, binary_path, home_dir);
+        // `serde_json::to_string_pretty` escapes embedded backslashes/quotes
+        // in `binary_path` automatically, so the rendered JSON is always
+        // round-trippable regardless of the OS path conventions.
+        return serde_json::to_string_pretty(&value)
+            .expect("serializing a serde_json::Value cannot fail");
+    }
     template
         .replace("{{BINARY_PATH}}", binary_path)
         .replace("{{HOME}}", home_dir)
+}
+
+/// Walk a `serde_json::Value` tree and replace `{{BINARY_PATH}}` / `{{HOME}}`
+/// occurrences inside any string leaf with the resolved values. Only string
+/// leaves are touched — keys, numbers, booleans, etc. are passed through.
+fn substitute_json_placeholders(value: &mut serde_json::Value, binary_path: &str, home_dir: &str) {
+    match value {
+        serde_json::Value::String(s) => {
+            // Whole-string replacements (the common case for `binary_path`)
+            // and embedded substitutions both work — `String::replace` is a
+            // substring rewrite.
+            *s = s
+                .replace("{{BINARY_PATH}}", binary_path)
+                .replace("{{HOME}}", home_dir);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                substitute_json_placeholders(item, binary_path, home_dir);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                substitute_json_placeholders(v, binary_path, home_dir);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Resolve the path to the currently-running `aegis` binary so the service
@@ -275,11 +326,38 @@ pub fn template_for(kind: ServiceKind) -> &'static str {
 
 /// Install the service unit using the supplied manager. Renders the platform
 /// template against the current `aegis` binary path and the user's home dir.
+///
+/// Belt-and-suspenders to the systemd template's `ReadWritePaths=-` prefix:
+/// before handing the rendered unit to the manager (which on Linux issues
+/// `systemctl --user enable --now`), we ensure the daemon's state directory
+/// exists so the very first start picks up the bind-mount cleanly. The `-`
+/// prefix on `ReadWritePaths` makes systemd tolerate a *missing* path without
+/// failing the unit, but it does NOT auto-rebind once the path appears later
+/// — a restart is required. By creating the dir here we avoid that restart on
+/// the post-enroll install path. The daemon itself also creates the dir on
+/// startup (see `commands::edge::daemon::run`), so a manual `systemctl start`
+/// before enrollment still self-heals on the next start.
 pub fn install(mgr: &dyn ServiceManager, args: &InstallArgs) -> Result<InstallOutcome> {
+    if let Some(state_dir) = edge_state_dir() {
+        std::fs::create_dir_all(&state_dir).with_context(|| {
+            format!(
+                "create edge state dir {} prior to service install",
+                state_dir.display()
+            )
+        })?;
+    }
     let binary = current_binary_path();
     let home = home_dir_string();
     let content = render_unit_template(template_for(mgr.kind()), &binary, &home);
     mgr.install(&content, args.force, args.keep_existing)
+}
+
+/// Resolve the on-disk edge state directory (`$HOME/.aegis/edge`). Returns
+/// `None` when `$HOME` cannot be determined — in that case the install path
+/// proceeds without pre-creating the dir (the manager's downstream calls will
+/// surface the missing-home failure with a clearer error).
+fn edge_state_dir() -> Option<PathBuf> {
+    dirs_next::home_dir().map(|h| h.join(".aegis").join("edge"))
 }
 
 /// Uninstall the service unit using the supplied manager. Idempotent.
@@ -383,10 +461,8 @@ pub fn parse_systemd_show(output: &str) -> ServiceStatus {
                 "ActiveState" => active_state = v.to_string(),
                 "SubState" => sub_state = v.to_string(),
                 "MainPID" => main_pid = v.trim().parse().ok().filter(|p: &u32| *p != 0),
-                "ActiveEnterTimestamp" => {
-                    if !v.trim().is_empty() {
-                        active_enter = Some(v.trim().to_string());
-                    }
+                "ActiveEnterTimestamp" if !v.trim().is_empty() => {
+                    active_enter = Some(v.trim().to_string());
                 }
                 _ => {}
             }
@@ -421,6 +497,9 @@ pub fn parse_systemd_show(output: &str) -> ServiceStatus {
 /// Parse `launchctl list io.aegis.edge` output. The command prints a small
 /// property-list-shaped record on success and a non-zero exit on
 /// "not-installed". Caller passes `None` for the latter.
+///
+/// Used by the macOS `LaunchctlServiceManager`; flagged unused on Linux/Windows.
+#[allow(dead_code)]
 pub fn parse_launchctl_list(output: Option<&str>) -> ServiceStatus {
     let Some(text) = output else {
         return ServiceStatus {
@@ -457,6 +536,9 @@ pub fn parse_launchctl_list(output: Option<&str>) -> ServiceStatus {
 /// Parse `sc.exe query AegisEdge` output. Output is `STATE : <code> <name>`
 /// where running == 4, stopped == 1, paused == 7. The CLI returns a non-zero
 /// exit and "service does not exist" message when not installed.
+///
+/// Used by the Windows `NssmServiceManager`; flagged unused on Linux/macOS.
+#[allow(dead_code)]
 pub fn parse_sc_query(output: Option<&str>) -> ServiceStatus {
     let Some(text) = output else {
         return ServiceStatus {
@@ -787,7 +869,14 @@ impl ServiceManager for LaunchdManager {
             .output()
             .context("invoke log show")?;
         let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines().rev().take(lines).collect::<Vec<_>>().iter().rev() {
+        for line in text
+            .lines()
+            .rev()
+            .take(lines)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+        {
             println!("{line}");
         }
         Ok(())
@@ -937,10 +1026,7 @@ impl ServiceManager for NssmManager {
             bail!("aegis edge service not installed; nothing to tail");
         }
         let body = std::fs::read_to_string(&self.spec_path).with_context(|| {
-            format!(
-                "read nssm spec for log paths {}",
-                self.spec_path.display()
-            )
+            format!("read nssm spec for log paths {}", self.spec_path.display())
         })?;
         let spec: serde_json::Value = serde_json::from_str(&body)?;
         let stdout = spec
@@ -1084,6 +1170,70 @@ mod tests {
             out,
             "/usr/local/bin/aegis edge daemon --state-dir /home/jeshua/.aegis/edge"
         );
+    }
+
+    #[test]
+    fn systemd_template_marks_state_dir_bind_mount_tolerant_of_missing_path() {
+        // Regression: production was crash-looping with
+        //   aegis-edge.service: Failed to set up mount namespacing:
+        //   /home/<user>/.aegis/edge: No such file or directory
+        //   Main process exited, code=exited, status=226/NAMESPACE
+        // because `ReadWritePaths=%h/.aegis/edge` (no `-` prefix) hard-fails
+        // namespace setup if the path doesn't exist when the unit starts —
+        // even though the daemon creates the dir on startup. The `-` prefix
+        // makes systemd silently skip the bind when the path is missing.
+        let body = render_unit_template(
+            template_for(ServiceKind::SystemdUser),
+            "/usr/local/bin/aegis",
+            "/home/jeshua",
+        );
+        assert!(
+            body.contains("ReadWritePaths=-%h/.aegis/edge"),
+            "ReadWritePaths must use the `-` prefix to tolerate a missing \
+             state dir at unit-start time; got: {body}"
+        );
+        // Negative: the unprefixed form must NOT appear (otherwise the
+        // tolerant entry above could coexist with a hard-fail entry and
+        // namespace setup would still fail).
+        assert!(
+            !body.contains("\nReadWritePaths=%h/.aegis/edge"),
+            "no untolerated `ReadWritePaths=%h/.aegis/edge` may remain in the \
+             unit; only the `-`-prefixed form is permitted: {body}"
+        );
+    }
+
+    #[test]
+    fn install_creates_edge_state_dir_before_handing_to_manager() {
+        // Regression: the install path must materialize `$HOME/.aegis/edge`
+        // before the systemd unit is enabled+started, otherwise the very
+        // first start hits the `ReadWritePaths=-` skip and the daemon needs
+        // an extra restart to pick up the bind. We point `$HOME` at a temp
+        // dir, run install via the mock manager, and assert the directory
+        // exists afterwards.
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY: tests in this module are not run concurrently with other
+        // tests that mutate $HOME; cargo test serializes within a process
+        // for `#[test]` fns sharing process-global env at our scale.
+        std::env::set_var("HOME", tmp.path());
+        let mock = MockServiceManager::new(
+            ServiceKind::SystemdUser,
+            tmp.path().join("aegis-edge.service"),
+        );
+        let outcome = install(&mock, &InstallArgs::default()).expect("install ok");
+        assert!(matches!(outcome, InstallOutcome::Installed { .. }));
+        let state_dir = tmp.path().join(".aegis").join("edge");
+        assert!(
+            state_dir.is_dir(),
+            "install must pre-create {} so the first systemd start \
+             binds the path cleanly",
+            state_dir.display()
+        );
+        // Restore $HOME for any sibling tests.
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]

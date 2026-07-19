@@ -254,6 +254,9 @@ mod tests {
         async fn list_by_tenant(&self, _t: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>> {
             Ok(vec![])
         }
+        async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(self.edges.lock().await.values().cloned().collect())
+        }
         async fn update_status(&self, _: &NodeId, _: NodePeerStatus) -> anyhow::Result<()> {
             Ok(())
         }
@@ -698,7 +701,7 @@ mod tests {
         let delta = exp - iat;
         // Allow small slack (clock granularity / wall-clock between reads).
         assert!(
-            delta <= 35 && delta >= 25,
+            (25..=35).contains(&delta),
             "exp-iat={delta} expected ~30s for ttl=30; service ignored configured TTL"
         );
     }

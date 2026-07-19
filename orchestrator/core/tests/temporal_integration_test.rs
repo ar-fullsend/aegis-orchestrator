@@ -443,6 +443,14 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
     ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         Ok(vec![])
     }
+
+    async fn list_paginated_all(
+        &self,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
 }
 
 struct FailingWorkflowExecRepo;
@@ -537,6 +545,14 @@ impl WorkflowExecutionRepository for FailingWorkflowExecRepo {
     async fn list_paginated_for_tenant(
         &self,
         _tenant_id: &TenantId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
+
+    async fn list_paginated_all(
+        &self,
         _limit: usize,
         _offset: usize,
     ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
@@ -762,7 +778,7 @@ async fn recording_workflow_engine_captures_start_call_arguments() {
         .start_workflow(
             aegis_orchestrator_core::application::ports::StartWorkflowParams {
                 workflow_id: "workflow-alpha",
-                execution_id: execution_id.clone(),
+                execution_id,
                 tenant_id: "aegis-system",
                 input: input.clone(),
                 blackboard: None,

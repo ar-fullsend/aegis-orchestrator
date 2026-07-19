@@ -33,6 +33,19 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+
+use crate::domain::iam::{IdentityKind, UserIdentity};
+
+/// Local mirror of the daemon-layer `is_operator` helper. Edge handlers live
+/// in `orchestrator-core` rather than `cli`, so they cannot reference the
+/// daemon-layer copy. Kept in sync with that helper — both must agree on the
+/// definition of "operator" or operator-only branches diverge.
+fn is_operator(identity: Option<&UserIdentity>) -> bool {
+    matches!(
+        identity.map(|i| &i.identity_kind),
+        Some(IdentityKind::Operator { .. })
+    )
+}
 use prost_types::Struct;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -231,12 +244,21 @@ fn host_view(
 async fn list_hosts(
     State(s): State<EdgeApiState>,
     Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
 ) -> Result<Json<Vec<EdgeHostView>>, ApiError> {
-    let edges = s
-        .edge_repo
-        .list_by_tenant(&tenant)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    // Operator cross-tenant aggregation (ADR-097): each host already
+    // carries its `tenant_id` in [`EdgeHostView`].
+    let edges = if is_operator(identity.as_ref().map(|e| &e.0)) {
+        s.edge_repo
+            .list_all()
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    } else {
+        s.edge_repo
+            .list_by_tenant(&tenant)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    };
     Ok(Json(
         edges
             .iter()
@@ -248,6 +270,7 @@ async fn list_hosts(
 async fn get_host(
     State(s): State<EdgeApiState>,
     Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
     Path(id): Path<String>,
 ) -> Result<Json<EdgeHostView>, ApiError> {
     let nid = parse_node_id(&id)?;
@@ -257,7 +280,9 @@ async fn get_host(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("edge"))?;
-    if edge.tenant_id != tenant {
+    // Operator cross-tenant detail fetch (ADR-097): operators bypass the
+    // tenant gate; the projection includes the host's own `tenant_id`.
+    if !is_operator(identity.as_ref().map(|e| &e.0)) && edge.tenant_id != tenant {
         return Err(ApiError::not_found("edge"));
     }
     Ok(Json(host_view(&edge, &s.connection_registry)))
@@ -344,9 +369,6 @@ fn map_tags_err(e: crate::application::edge::manage_tags::ManageTagsError) -> Ap
     use crate::application::edge::manage_tags::ManageTagsError;
     match e {
         ManageTagsError::NotFound => ApiError::not_found("edge"),
-        ManageTagsError::Forbidden => {
-            ApiError::new(StatusCode::FORBIDDEN, "forbidden", "cross-tenant refused")
-        }
         ManageTagsError::Repo(msg) => ApiError::internal(msg),
     }
 }
@@ -355,9 +377,6 @@ fn map_revoke_err(e: crate::application::edge::revoke_edge::RevokeEdgeError) -> 
     use crate::application::edge::revoke_edge::RevokeEdgeError;
     match e {
         RevokeEdgeError::NotFound => ApiError::not_found("edge"),
-        RevokeEdgeError::Forbidden => {
-            ApiError::new(StatusCode::FORBIDDEN, "forbidden", "cross-tenant refused")
-        }
         RevokeEdgeError::Repo(msg) => ApiError::internal(msg),
     }
 }
@@ -390,6 +409,7 @@ struct CreateGroup {
 struct GroupView {
     id: String,
     name: String,
+    tenant_id: String,
     selector: EdgeSelector,
     pinned_members: Vec<String>,
     created_by: String,
@@ -400,6 +420,7 @@ fn group_view(g: &crate::domain::edge::EdgeGroup) -> GroupView {
     GroupView {
         id: g.id.to_string(),
         name: g.name.clone(),
+        tenant_id: g.tenant_id.as_str().to_string(),
         selector: g.selector.clone(),
         pinned_members: g.pinned_members.iter().map(|n| n.to_string()).collect(),
         created_by: g.created_by.clone(),
@@ -428,18 +449,40 @@ async fn create_group(
 async fn list_groups(
     State(s): State<EdgeApiState>,
     Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
 ) -> Result<Json<Vec<GroupView>>, ApiError> {
-    let gs = s.group_service.list(&tenant).await.map_err(map_group_err)?;
+    // Operator cross-tenant aggregation (ADR-097): bypass `group_service.list`
+    // (tenant-scoped) and use `list_all_unscoped`. Each group carries its
+    // own `tenant_id` in the projection.
+    let gs = if is_operator(identity.as_ref().map(|e| &e.0)) {
+        s.group_service
+            .list_all_unscoped()
+            .await
+            .map_err(map_group_err)?
+    } else {
+        s.group_service.list(&tenant).await.map_err(map_group_err)?
+    };
     Ok(Json(gs.iter().map(group_view).collect()))
 }
 
 async fn get_group(
     State(s): State<EdgeApiState>,
     Extension(tenant): Extension<TenantId>,
+    identity: Option<Extension<UserIdentity>>,
     Path(id): Path<String>,
 ) -> Result<Json<GroupView>, ApiError> {
     let gid =
         EdgeGroupId(uuid::Uuid::parse_str(&id).map_err(|e| ApiError::bad_request(e.to_string()))?);
+    if is_operator(identity.as_ref().map(|e| &e.0)) {
+        // Operator cross-tenant detail fetch (ADR-097): bypass the
+        // service-layer tenant gate.
+        let g = s
+            .group_service
+            .get_unscoped(gid)
+            .await
+            .map_err(map_group_err)?;
+        return Ok(Json(group_view(&g)));
+    }
     let g = s
         .group_service
         .get(&tenant, gid)
@@ -717,6 +760,9 @@ mod tests {
         async fn list_by_tenant(&self, _tenant_id: &TenantId) -> anyhow::Result<Vec<EdgeDaemon>> {
             Ok(vec![])
         }
+        async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(vec![])
+        }
         async fn update_status(
             &self,
             _node_id: &NodeId,
@@ -762,6 +808,9 @@ mod tests {
             &self,
             _tenant_id: &TenantId,
         ) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError> {
+            Ok(vec![])
+        }
+        async fn list_all(&self) -> Result<Vec<EdgeGroup>, EdgeGroupRepoError> {
             Ok(vec![])
         }
         async fn update(&self, _group: &EdgeGroup) -> Result<(), EdgeGroupRepoError> {
@@ -1065,6 +1114,9 @@ mod tests {
                 .cloned()
                 .collect())
         }
+        async fn list_all(&self) -> anyhow::Result<Vec<EdgeDaemon>> {
+            Ok(self.edges.lock().await.values().cloned().collect())
+        }
         async fn update_status(&self, id: &NodeId, status: NodePeerStatus) -> anyhow::Result<()> {
             if let Some(e) = self.edges.lock().await.get_mut(id) {
                 e.status = status;
@@ -1306,7 +1358,7 @@ mod tests {
     #[tokio::test]
     async fn patch_host_cross_tenant_returns_404() {
         let tenant_a = TenantId::new("t-a").unwrap();
-        let tenant_b = TenantId::new("t-b").unwrap();
+        let _tenant_b = TenantId::new("t-b").unwrap();
         let node_id = NodeId::new();
         let repo = Arc::new(InMemoryEdgeRepo::new());
         repo.seed(seed_edge(node_id, &tenant_a, "a-laptop")).await;
@@ -1402,6 +1454,158 @@ mod tests {
             v[0].get("connected").and_then(|x| x.as_bool()),
             Some(true),
             "registered ConnectEdge stream MUST surface as connected:true"
+        );
+    }
+
+    // ── Revoke regression suite ────────────────────────────────────────
+    //
+    // Bug: clicking "Revoke" in Zaru's `/vault/edge-hosts` page surfaced
+    // a 204 from the orchestrator, but the host stayed in the list. The
+    // root cause was in `RevokeEdgeService`: it set `status = Unhealthy`
+    // instead of deleting the row, and `list_by_tenant` has no status
+    // filter — so the revoked host kept appearing in the UI and the
+    // operator perceived Revoke as a no-op. The fix hard-deletes the row
+    // and evicts any live `ConnectEdge` stream sender from
+    // `EdgeConnectionRegistry`; these tests pin the new contract end-to-
+    // end through the REST handler.
+
+    /// Regression: `DELETE /v1/edge/hosts/:id` MUST 204 and remove the
+    /// host from the next `GET /v1/edge/hosts` projection.
+    #[tokio::test]
+    async fn delete_host_removes_row_from_subsequent_list_by_tenant() {
+        let tenant = TenantId::new("t-consumer").unwrap();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        let nid = NodeId::new();
+        repo.seed(seed_edge(nid, &tenant, "to-be-revoked")).await;
+        let app = router_with_repo(repo.clone());
+
+        let req = HttpRequest::builder()
+            .method("DELETE")
+            .uri(format!("/v1/edge/hosts/{}", nid.0))
+            .header("X-Tenant-Id", "t-consumer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "DELETE /v1/edge/hosts/:id must 204 on success"
+        );
+
+        // Repo round-trip: the row must be gone — not merely flagged as
+        // Unhealthy. A status flag would not help the UI because the
+        // list projection has no status filter.
+        assert!(
+            repo.get(&nid).await.unwrap().is_none(),
+            "DELETE must hard-delete the edge_daemons row"
+        );
+
+        // Wire-shape round-trip: the next GET /v1/edge/hosts must omit
+        // the revoked host. This is what Zaru's React Query cache
+        // refetches after the mutation invalidates `["edge","hosts"]`.
+        let list_req = HttpRequest::builder()
+            .method("GET")
+            .uri("/v1/edge/hosts")
+            .header("X-Tenant-Id", "t-consumer")
+            .body(Body::empty())
+            .unwrap();
+        let list_resp = app.oneshot(list_req).await.unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(list_resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = v.as_array().unwrap();
+        assert!(
+            arr.is_empty(),
+            "revoked host MUST disappear from GET /v1/edge/hosts \
+             (got {arr:?}) — Zaru's UI relies on the row being absent, \
+             not on a status string"
+        );
+    }
+
+    /// Regression: cross-tenant tag mutation via PATCH MUST 404 without
+    /// mutating the foreign tenant's tags. Returning 403 leaks resource
+    /// existence to the wrong tenant — see ADR-083 §4.5–§4.8 and
+    /// security audit 002 findings 4.33 / 4.37.7. Sibling fence to the
+    /// DELETE-cross-tenant regression below.
+    #[tokio::test]
+    async fn tags_cross_tenant_returns_404_and_keeps_state() {
+        let tenant_a = TenantId::new("t-a").unwrap();
+        let nid = NodeId::new();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        let mut seeded = seed_edge(nid, &tenant_a, "a-laptop");
+        seeded.capabilities.tags = vec!["prod".to_string()];
+        repo.seed(seeded).await;
+        let app = router_with_repo(repo.clone());
+
+        // Cross-tenant `add_tags` via PATCH MUST 404.
+        let req = HttpRequest::builder()
+            .method("PATCH")
+            .uri(format!("/v1/edge/hosts/{}", nid.0))
+            .header("X-Tenant-Id", "t-b")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"add_tags":["hostile"]}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "cross-tenant add_tags must 404, not 403 — 403 leaks existence"
+        );
+        assert_eq!(
+            repo.get(&nid).await.unwrap().unwrap().capabilities.tags,
+            vec!["prod".to_string()],
+            "cross-tenant add_tags MUST NOT mutate the foreign tenant's tags"
+        );
+
+        // Cross-tenant `remove_tags` via PATCH MUST 404 too.
+        let app = router_with_repo(repo.clone());
+        let req = HttpRequest::builder()
+            .method("PATCH")
+            .uri(format!("/v1/edge/hosts/{}", nid.0))
+            .header("X-Tenant-Id", "t-b")
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"remove_tags":["prod"]}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "cross-tenant remove_tags must 404, not 403"
+        );
+        assert_eq!(
+            repo.get(&nid).await.unwrap().unwrap().capabilities.tags,
+            vec!["prod".to_string()],
+            "cross-tenant remove_tags MUST NOT mutate the foreign tenant's tags"
+        );
+    }
+
+    /// Regression: cross-tenant DELETE MUST 404 without mutating the
+    /// foreign tenant's row. Tenant isolation parity with PATCH.
+    #[tokio::test]
+    async fn delete_host_cross_tenant_returns_404_and_keeps_row() {
+        let tenant_a = TenantId::new("t-a").unwrap();
+        let nid = NodeId::new();
+        let repo = Arc::new(InMemoryEdgeRepo::new());
+        repo.seed(seed_edge(nid, &tenant_a, "a-laptop")).await;
+        let app = router_with_repo(repo.clone());
+
+        let req = HttpRequest::builder()
+            .method("DELETE")
+            .uri(format!("/v1/edge/hosts/{}", nid.0))
+            .header("X-Tenant-Id", "t-b")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "tenant_b must not be able to revoke tenant_a's host"
+        );
+        assert!(
+            repo.get(&nid).await.unwrap().is_some(),
+            "cross-tenant DELETE MUST NOT remove the foreign tenant's row"
         );
     }
 
